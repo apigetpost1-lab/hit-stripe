@@ -1,0 +1,17 @@
+{
+  "name": "hit-stripe",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://us-east-1.gateway.connections.autonomous-agents.kiro.dev/apigetpost1-lab/hit-stripe.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}

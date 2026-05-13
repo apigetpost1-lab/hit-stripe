@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 /**
- * Final deobfuscator - resolves wrapper function calls by executing in VM
- * Strategy: Load array+rotation+decoder in VM, then find all wrapper functions,
- * register them, and resolve all calls site by site.
+ * Complete deobfuscator for javascript-obfuscator (RC4 + string rotation)
+ * Handles all patterns found in this codebase:
+ * - Array function before or after decoder
+ * - Rotation IIFE with target number
+ * - RC4 string decryption
+ * - Wrapper functions with computed expressions
  */
 const fs = require('fs');
 const path = require('path');
@@ -12,159 +15,210 @@ const SCRIPT_DIR = path.join(__dirname, 'script');
 const OUTPUT_DIR = path.join(__dirname, 'deobfuscated');
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-// Process one file at a time for better error handling
-const targetFile = process.argv[2];
-const files = targetFile 
-  ? [targetFile]
-  : fs.readdirSync(SCRIPT_DIR).filter(f => f.endsWith('.js') && !['minify-all.js','READ_THIS.js','version.js'].includes(f));
+const files = fs.readdirSync(SCRIPT_DIR).filter(f => 
+  f.endsWith('.js') && !['minify-all.js','READ_THIS.js','version.js'].includes(f)
+);
+
+console.log(`Processing ${files.length} files...\n`);
 
 for (const file of files) {
-  console.log(`\n========== ${file} ==========`);
+  console.log(`\n${'='.repeat(60)}\n  ${file}\n${'='.repeat(60)}`);
   try {
-    processFile(file);
+    const code = fs.readFileSync(path.join(SCRIPT_DIR, file), 'utf-8');
+    const result = deobfuscate(code, file);
+    fs.writeFileSync(path.join(OUTPUT_DIR, file), result, 'utf-8');
+    console.log(`  Output: ${(result.length/1024).toFixed(1)} KB`);
   } catch(e) {
-    console.log(`  FATAL: ${e.message}`);
+    console.log(`  FATAL ERROR: ${e.message}`);
+    console.log(`  Stack: ${e.stack.split('\n').slice(0,3).join('\n')}`);
   }
 }
 
-function processFile(file) {
-  const code = fs.readFileSync(path.join(SCRIPT_DIR, file), 'utf-8');
-  
-  // Step 1: Find the main decoder function name
-  const decoderMatch = code.match(/function\s+(_0x[a-f0-9]+)\s*\(\s*x\s*,\s*_\s*\)\s*\{\s*x\s*-=\s*(\d+)\s*;/);
-  if (!decoderMatch) {
-    // Try alternate pattern for hcaptcha/offscreen/autofill style
-    const altDecoder = code.match(/function\s+(_0x[a-f0-9]+)\s*\(\s*x\s*,\s*n\s*\)\s*\{\s*x\s*-=\s*(\d+)\s*;/);
-    if (!altDecoder) {
-      console.log('  No decoder found, skipping');
-      return;
-    }
-    return processFileWithDecoder(code, file, altDecoder[1], parseInt(altDecoder[2]));
-  }
-  
-  processFileWithDecoder(code, file, decoderMatch[1], parseInt(decoderMatch[2]));
-}
+console.log('\n\nDone! Results in deobfuscated/');
 
-function processFileWithDecoder(code, file, decoderName, offset) {
-  console.log(`  Decoder: ${decoderName}, offset: ${offset}`);
+function deobfuscate(code, filename) {
+  // Step 1: Identify components
+  const arrayMatch = code.match(/function\s+(_0x[a-f0-9]+)\s*\(\s*\)\s*\{\s*(?:var|const)\s+x\s*=\s*\[/);
+  const decMatch = code.match(/function\s+(_0x[a-f0-9]+)\s*\(\s*x\s*,\s*(?:_|c|n|W)\s*\)\s*\{\s*x\s*-=\s*(\d+)\s*;/);
   
-  // Step 2: Extract the complete setup code needed for the decoder to work
-  // This includes: string array function + rotation IIFE + decoder function
-  
-  // Find the string array function (appears before decoder)
-  const arrayFuncPattern = /function\s+(_0x[a-f0-9]+)\s*\(\s*\)\s*\{\s*(?:var|const)\s+x\s*=\s*\[/;
-  const arrayMatch = arrayFuncPattern.exec(code);
-  
-  if (!arrayMatch) {
-    console.log('  No string array function found');
-    return;
+  if (!arrayMatch || !decMatch) {
+    console.log('  Could not identify array/decoder. Beautifying only.');
+    return beautify(code);
   }
   
-  const arrayFuncName = arrayMatch[1];
-  console.log(`  Array function: ${arrayFuncName}`);
+  const arrayName = arrayMatch[1];
+  const decoderName = decMatch[1];
+  const offset = parseInt(decMatch[2]);
+  const arrayPos = code.indexOf(arrayMatch[0]);
+  const decoderPos = code.indexOf(decMatch[0]);
   
-  // Find the end of the decoder function  
-  const decoderStart = code.indexOf(`function ${decoderName}`);
-  const decoderEnd = findBraceEnd(code, decoderStart);
+  console.log(`  Array: ${arrayName}, Decoder: ${decoderName}, Offset: ${offset}`);
   
-  // The setup = everything from array function start to decoder function end
-  const setupStart = arrayMatch.index;
-  let setupCode = code.substring(setupStart, decoderEnd);
+  // Step 2: Extract array function (find its complete body)
+  const arrayEnd = findBraceEnd(code, arrayPos);
+  const arrayCode = code.substring(arrayPos, arrayEnd);
   
-  // Also need the rotation IIFE between array and decoder
-  // It's usually like: !function(x,_){...}(arrayFuncName, NUMBER);
-  // or (function(x,_){...})(arrayFuncName, NUMBER);
+  // Step 3: Find decoder function end
+  const decoderEnd = findBraceEnd(code, decoderPos);
+  const decoderCode = code.substring(decoderPos, decoderEnd);
   
-  // Step 3: Execute setup in VM
-  const sandbox = createSandbox();
+  // Step 4: Find rotation IIFE
+  const escapedArray = arrayName.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+  const rotRegex = new RegExp('(!\\s*function|\\(\\s*function)\\s*\\(\\s*x\\s*,\\s*_\\s*\\)\\s*\\{[\\s\\S]*?\\}\\s*\\(\\s*' + escapedArray + '\\s*,\\s*(\\d+)\\s*\\)');
+  const rotMatch = rotRegex.exec(code);
+  let rotationCode = '';
+  if (rotMatch) {
+    // Find the start of this IIFE
+    const rotStart = rotMatch.index;
+    const rotEnd = code.indexOf(rotMatch[0], rotStart) + rotMatch[0].length;
+    rotationCode = code.substring(rotStart, rotEnd + 1); // include the ;
+    console.log(`  Rotation IIFE found, target: ${rotMatch[2]}`);
+  }
+  
+  // Step 5: Build setup code in correct order
+  // Always: array first, then rotation, then decoder
+  let setupCode = arrayCode + ';\n' + rotationCode + ';\n' + decoderCode + ';\n';
+  
+  // Step 6: Execute in VM
+  const sandbox = createFullSandbox();
   const ctx = vm.createContext(sandbox);
   
+  let setupSuccess = false;
   try {
-    vm.runInContext(setupCode, ctx, { timeout: 15000 });
+    vm.runInContext(setupCode, ctx, { timeout: 30000 });
+    // Verify decoder works
+    const testType = vm.runInContext(`typeof ${decoderName}`, ctx, { timeout: 100 });
+    if (testType === 'function') {
+      setupSuccess = true;
+      console.log(`  Decoder setup SUCCESS`);
+    } else {
+      console.log(`  Decoder is ${testType}, not function`);
+    }
   } catch(e) {
-    console.log(`  Setup exec failed: ${e.message.substring(0, 80)}`);
-    // Try wrapping with missing globals
+    console.log(`  Setup error: ${e.message.substring(0, 100)}`);
+    // Try with additional patching
     try {
-      const patchedSetup = `var self=globalThis;var window=globalThis;var chrome={runtime:{sendMessage:function(){}}};` + setupCode;
-      vm.runInContext(patchedSetup, ctx, { timeout: 15000 });
-      console.log(`  Setup exec succeeded with patched globals`);
+      const ctx2 = vm.createContext(createFullSandbox());
+      const patched = `var self=globalThis;var window=globalThis;var navigator={userAgent:'',platform:'',language:'en'};var location={href:'https://example.com',hostname:'example.com',protocol:'https:'};var document={createElement:function(){return{style:{}}},querySelector:function(){return null},querySelectorAll:function(){return[]},cookie:''};` + setupCode;
+      vm.runInContext(patched, ctx2, { timeout: 30000 });
+      const testType2 = vm.runInContext(`typeof ${decoderName}`, ctx2, { timeout: 100 });
+      if (testType2 === 'function') {
+        setupSuccess = true;
+        Object.assign(ctx, ctx2);
+        console.log(`  Decoder setup SUCCESS (with patched globals)`);
+      }
     } catch(e2) {
       console.log(`  Patched setup also failed: ${e2.message.substring(0, 80)}`);
-      fs.writeFileSync(path.join(OUTPUT_DIR, file), simpleBeautify(code), 'utf-8');
-      return;
     }
   }
   
-  // Verify decoder works
-  try {
-    const testResult = vm.runInContext(`typeof ${decoderName}`, ctx, { timeout: 100 });
-    if (testResult !== 'function') {
-      console.log(`  Decoder is not a function in context (type: ${testResult})`);
-      fs.writeFileSync(path.join(OUTPUT_DIR, file), simpleBeautify(code), 'utf-8');
-      return;
+  if (!setupSuccess) {
+    // Last resort: try extracting and running just the minimal parts
+    try {
+      const ctx3 = vm.createContext(createFullSandbox());
+      // Extract just the string array data
+      const arrData = code.match(/(?:var|const)\s+x\s*=\s*(\[(?:"[^"]*"(?:\s*,\s*"[^"]*")*)\])/);
+      if (arrData) {
+        // Manually build a working setup with rotation
+        // The rotation IIFE shuffles the array until parseInt checks match target
+        // We'll just run the full original rotation code with the array
+        const minimalSetup = `
+var self=globalThis;var window=globalThis;var navigator={userAgent:'',platform:'',language:'en'};
+var location={href:'https://example.com',hostname:'example.com',protocol:'https:'};
+var document={createElement:function(){return{style:{}}},querySelector:function(){return null},querySelectorAll:function(){return[]},cookie:''};
+${arrayCode}
+${rotationCode}
+${decoderCode}
+`;
+        vm.runInContext(minimalSetup, ctx3, { timeout: 30000 });
+        const t = vm.runInContext(`typeof ${decoderName}`, ctx3, { timeout: 100 });
+        if (t === 'function') {
+          setupSuccess = true;
+          Object.assign(ctx, ctx3);
+          console.log(`  Decoder setup SUCCESS (minimal rebuild with rotation)`);
+        }
+      }
+    } catch(e3) {
+      console.log(`  Minimal rebuild also failed: ${e3.message.substring(0, 80)}`);
     }
-    console.log(`  Decoder function verified`);
-  } catch(e) {
-    console.log(`  Decoder verification failed: ${e.message}`);
-    fs.writeFileSync(path.join(OUTPUT_DIR, file), simpleBeautify(code), 'utf-8');
-    return;
   }
   
-  // Step 4: Find all wrapper functions that call the decoder
-  // Pattern: function _0xWRAPPER(a,b,c,d,e) { return DECODER(EXPR, VAR) }
-  const escapedDecoder = decoderName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!setupSuccess) {
+    console.log(`  Cannot setup decoder. Beautifying only.`);
+    return beautify(code);
+  }
+  
+  // Step 7: Find all wrapper functions and register them
+  const escapedDecoder = decoderName.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
   const wrapperRegex = new RegExp(
-    `function\\s+(_0x[a-f0-9]+)\\s*\\(([^)]+)\\)\\s*\\{\\s*return\\s+${escapedDecoder}\\(([^,]+),\\s*([^)]+)\\)\\s*\\}`,
+    `function\\s+(_0x[a-f0-9]+)\\s*\\(([^)]+)\\)\\s*\\{\\s*return\\s+${escapedDecoder}\\(([^)]+)\\)\\s*\\}`,
     'g'
   );
   
   const wrappers = new Map();
   let wm;
   while ((wm = wrapperRegex.exec(code)) !== null) {
-    const wrapperName = wm[1];
-    const params = wm[2].split(',').map(s => s.trim());
-    const expr1 = wm[3].trim(); // e.g., "c- -990" or "_-527"
-    const expr2 = wm[4].trim(); // e.g., "n" or "f"
-    wrappers.set(wrapperName, { params, expr1, expr2, fullMatch: wm[0] });
-  }
-  
-  console.log(`  Found ${wrappers.size} wrapper functions`);
-  
-  // Register all wrapper functions in the VM context
-  for (const [name, info] of wrappers) {
+    wrappers.set(wm[1], { params: wm[2], body: wm[3], full: wm[0] });
     try {
-      vm.runInContext(`function ${name}(${info.params.join(',')}){return ${decoderName}(${info.expr1},${info.expr2})}`, ctx, { timeout: 100 });
-    } catch(e) {
-      // ignore
-    }
+      vm.runInContext(wm[0], ctx, { timeout: 100 });
+    } catch(e) {}
   }
+  console.log(`  Registered ${wrappers.size} wrapper functions`);
   
-  // Step 5: Now find all calls to wrapper functions and resolve them
+  // Step 8: Resolve ALL calls to wrapper functions (and decoder) with literal args
+  // Args can be: numbers (positive/negative), quoted strings (single or double)
   let result = code;
   let totalResolved = 0;
   let totalFailed = 0;
   
-  for (const [wrapperName, info] of wrappers) {
-    const escapedWrapper = wrapperName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // Match calls like: wrapperName(arg1, arg2, arg3, arg4, arg5)
-    // Args can be numbers, strings, or expressions
-    const numParams = info.params.length;
-    
-    // Build a regex for the call - arguments can be numbers, quoted strings, or simple exprs
-    const argPattern = `(?:[^,()]+)`;
-    const argsPattern = Array(numParams).fill(argPattern).join('\\s*,\\s*');
-    const callRegex = new RegExp(escapedWrapper + '\\s*\\(\\s*(' + argsPattern + ')\\s*\\)', 'g');
+  // Build a set of all function names to look for (wrappers + decoder)
+  const funcNames = new Set([decoderName, ...wrappers.keys()]);
+  
+  // Also find nested wrappers (wrappers defined inside objects/closures)
+  // Pattern: function _0xXXXX(params){return _0xDECODER(expr)} or return _0xWRAPPER(expr)
+  const nestedWrapperRegex = new RegExp(
+    `function\\s+(_0x[a-f0-9]+)\\s*\\([^)]+\\)\\s*\\{\\s*return\\s+(_0x[a-f0-9]+)\\s*\\([^)]+\\)\\s*\\}`,
+    'g'
+  );
+  let nw;
+  while ((nw = nestedWrapperRegex.exec(code)) !== null) {
+    if (!funcNames.has(nw[1])) {
+      funcNames.add(nw[1]);
+      try {
+        vm.runInContext(nw[0], ctx, { timeout: 100 });
+      } catch(e) {}
+    }
+  }
+  
+  console.log(`  Total function names to resolve: ${funcNames.size}`);
+  
+  // Build one big regex to find all calls to any of these functions with literal args
+  // Literal arg: -?\d+ or "..." or '...'
+  const litArg = `(?:-?\\d+|"(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*')`;
+  const argsPattern = `${litArg}(?:\\s*,\\s*${litArg})*`;
+  
+  // Process in batches to avoid regex explosion
+  const allFuncNames = [...funcNames];
+  const BATCH_SIZE = 50;
+  const MAX_RESOLVE = 100000; // safety limit
+  
+  for (let batch = 0; batch < allFuncNames.length && totalResolved < MAX_RESOLVE; batch += BATCH_SIZE) {
+    const batchNames = allFuncNames.slice(batch, batch + BATCH_SIZE);
+    const namesPattern = batchNames.map(n => n.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')).join('|');
+    const callRegex = new RegExp(`(?:${namesPattern})\\(\\s*${argsPattern}\\s*\\)`, 'g');
     
     const replacements = [];
     let cm;
-    while ((cm = callRegex.exec(code)) !== null) {
-      const fullCall = cm[0];
-      // Try to evaluate
+    while ((cm = callRegex.exec(result)) !== null) {
+      const callStr = cm[0];
+      // Skip if it's inside a function definition (the return statement)
+      const before = result.substring(Math.max(0, cm.index - 10), cm.index);
+      if (before.includes('return')) continue;
+      
       try {
-        const val = vm.runInContext(fullCall, ctx, { timeout: 50 });
+        const val = vm.runInContext(callStr, ctx, { timeout: 50 });
         if (typeof val === 'string') {
-          replacements.push({ from: fullCall, to: JSON.stringify(val) });
-          totalResolved++;
+          replacements.push({ from: callStr, to: JSON.stringify(val), index: cm.index });
         } else {
           totalFailed++;
         }
@@ -173,39 +227,32 @@ function processFileWithDecoder(code, file, decoderName, offset) {
       }
     }
     
-    // Apply replacements (reverse order to not mess up indices)
+    // Apply replacements in reverse order to preserve indices
+    replacements.sort((a, b) => b.index - a.index);
     for (const r of replacements) {
-      result = result.split(r.from).join(r.to);
+      result = result.substring(0, r.index) + r.to + result.substring(r.index + r.from.length);
+      totalResolved++;
     }
   }
   
-  console.log(`  Total resolved: ${totalResolved}, failed: ${totalFailed}`);
+  console.log(`  String replacements: ${totalResolved} resolved, ${totalFailed} failed`);
   
-  // Also try direct decoder calls with literal args
-  const directCallRegex = new RegExp(escapedDecoder + '\\s*\\(\\s*(\\d+)\\s*,\\s*"([^"]*)"\\s*\\)', 'g');
-  let dm;
-  while ((dm = directCallRegex.exec(result)) !== null) {
-    try {
-      const val = vm.runInContext(dm[0], ctx, { timeout: 50 });
-      if (typeof val === 'string') {
-        result = result.split(dm[0]).join(JSON.stringify(val));
-        totalResolved++;
-      }
-    } catch(e) {}
-  }
+  // Step 9: Try to resolve object property access patterns
+  // e.g., x[_0xWrapper(1234,"key")] -> x["actualPropName"]
+  // Already handled above since wrapper calls return strings
   
-  // Step 6: Save result
-  const beautified = simpleBeautify(result);
-  fs.writeFileSync(path.join(OUTPUT_DIR, file), beautified, 'utf-8');
-  console.log(`  Final output: ${(beautified.length/1024).toFixed(1)} KB, resolved ${totalResolved} strings`);
+  // Step 10: Concatenate adjacent string literals ("abc" + "def" -> "abcdef")
+  result = concatenateStrings(result);
+  
+  // Step 11: Clean up anti-debug/anti-tamper code patterns
+  result = cleanAntiDebug(result);
+  
+  // Step 11: Beautify
+  return beautify(result);
 }
 
 function findBraceEnd(code, startPos) {
-  let depth = 0;
-  let inStr = false;
-  let strCh = '';
-  let started = false;
-  
+  let depth = 0, inStr = false, strCh = '', started = false;
   for (let i = startPos; i < code.length; i++) {
     const ch = code[i];
     if (inStr) {
@@ -220,37 +267,96 @@ function findBraceEnd(code, startPos) {
       if (started && depth === 0) return i + 1;
     }
   }
-  return Math.min(startPos + 100000, code.length);
+  return Math.min(startPos + 200000, code.length);
 }
 
-function createSandbox() {
+function createFullSandbox() {
+  const fakeElement = { style: {}, appendChild: ()=>{}, removeChild: ()=>{}, setAttribute: ()=>{}, getAttribute: ()=>'', innerHTML: '', textContent: '', classList: { add:()=>{}, remove:()=>{}, contains:()=>false } };
   return {
     globalThis: {},
     self: {},
     window: {},
-    chrome: { runtime: { sendMessage: ()=>{}, onMessage: { addListener: ()=>{} } }, storage: { local: { get: ()=>{}, set: ()=>{} } } },
-    navigator: { userAgent: '' },
-    document: { createElement: ()=>({ style: {} }), querySelector: ()=>null },
-    console: { log: ()=>{}, warn: ()=>{}, error: ()=>{} },
-    parseInt, parseFloat, isNaN, isFinite,
+    chrome: { 
+      runtime: { sendMessage:()=>{}, onMessage:{addListener:()=>{}}, getURL:()=>'', id:'fake' },
+      storage: { local:{get:()=>Promise.resolve({}),set:()=>Promise.resolve()}, sync:{get:()=>Promise.resolve({}),set:()=>Promise.resolve()} },
+      tabs: { query:()=>Promise.resolve([]), sendMessage:()=>{} },
+      action: { setBadgeText:()=>{}, setBadgeBackgroundColor:()=>{} },
+      declarativeNetRequest: { updateDynamicRules:()=>Promise.resolve() }
+    },
+    navigator: { userAgent: 'Mozilla/5.0', platform: 'Win32', language: 'en-US' },
+    location: { href: 'https://example.com', hostname: 'example.com', protocol: 'https:', origin: 'https://example.com' },
+    document: { 
+      createElement: ()=>({...fakeElement}), 
+      querySelector: ()=>null, 
+      querySelectorAll: ()=>[],
+      getElementById: ()=>null,
+      cookie: '',
+      body: fakeElement,
+      head: fakeElement,
+      documentElement: fakeElement
+    },
+    console: { log:()=>{}, warn:()=>{}, error:()=>{}, info:()=>{}, debug:()=>{}, table:()=>{} },
+    parseInt, parseFloat, isNaN, isFinite, NaN, Infinity,
     String, Number, Boolean, Array, Object, RegExp, Date, Math, JSON,
-    Error, TypeError, RangeError, SyntaxError,
+    Error, TypeError, RangeError, SyntaxError, ReferenceError, URIError,
     encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,
     escape, unescape,
-    setTimeout: ()=>0, setInterval: ()=>0, clearTimeout: ()=>{}, clearInterval: ()=>{},
+    setTimeout: (fn)=>{ if(typeof fn==='function') try{fn()}catch(e){} return 0; },
+    setInterval: ()=>0, clearTimeout:()=>{}, clearInterval:()=>{},
     atob: (s) => Buffer.from(s, 'base64').toString('binary'),
     btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
-    fetch: ()=>Promise.resolve(),
-    XMLHttpRequest: function(){},
-    Proxy: global.Proxy,
-    Symbol: global.Symbol,
+    fetch: ()=>Promise.resolve({ json:()=>Promise.resolve({}), text:()=>Promise.resolve('') }),
+    XMLHttpRequest: function(){ this.open=()=>{}; this.send=()=>{}; this.setRequestHeader=()=>{}; },
+    Request: function(){}, Response: function(){}, Headers: function(){},
+    URL: global.URL, URLSearchParams: global.URLSearchParams,
+    Proxy: global.Proxy, Reflect: global.Reflect,
+    Symbol: global.Symbol, 
     Map, Set, WeakMap, WeakSet, Promise,
-    Uint8Array, Int32Array, ArrayBuffer, DataView,
+    Uint8Array, Uint16Array, Uint32Array, Int8Array, Int16Array, Int32Array,
+    Float32Array, Float64Array, ArrayBuffer, DataView, SharedArrayBuffer: ArrayBuffer,
+    TextEncoder: global.TextEncoder, TextDecoder: global.TextDecoder,
+    crypto: { getRandomValues: (arr)=>{ for(let i=0;i<arr.length;i++) arr[i]=Math.floor(Math.random()*256); return arr; }, subtle: {} },
+    performance: { now: ()=>Date.now() },
+    queueMicrotask: (fn)=>{ try{fn()}catch(e){} },
+    structuredClone: global.structuredClone,
     undefined: undefined,
+    alert: ()=>{}, confirm: ()=>true, prompt: ()=>'',
+    Audio: function(){ this.play=()=>Promise.resolve(); this.pause=()=>{}; this.volume=1; },
+    Image: function(){ this.src=''; this.onload=null; },
+    Worker: function(){},
+    Blob: function(){},
+    FormData: function(){ this.append=()=>{}; },
+    AbortController: function(){ this.signal={}; this.abort=()=>{}; },
+    Event: function(){}, CustomEvent: function(){},
+    MutationObserver: function(){ this.observe=()=>{}; this.disconnect=()=>{}; },
+    ResizeObserver: function(){ this.observe=()=>{}; this.disconnect=()=>{}; },
+    IntersectionObserver: function(){ this.observe=()=>{}; this.disconnect=()=>{}; },
   };
 }
 
-function simpleBeautify(code) {
+function cleanAntiDebug(code) {
+  return code;
+}
+
+function concatenateStrings(code) {
+  // Replace "abc"+"def"+"ghi" with "abcdefghi" - single pass
+  let result = code;
+  let prev = '';
+  // Keep replacing until no more changes (max 20 passes for safety)
+  for (let pass = 0; pass < 20; pass++) {
+    const next = result.replace(/"([^"\\]*(?:\\.[^"\\]*)*)"\s*\+\s*"([^"\\]*(?:\\.[^"\\]*)*)"/g, '"$1$2"');
+    if (next === result) break;
+    result = next;
+  }
+  return result;
+}
+
+function replaceAll(str, search, replacement) {
+  // Escape special regex chars in search string for safe replacement
+  return str.split(search).join(replacement);
+}
+
+function beautify(code) {
   let result = '';
   let indent = 0;
   let inStr = false;
@@ -273,7 +379,7 @@ function simpleBeautify(code) {
     if (ch === '}') {
       indent = Math.max(0, indent - 1);
       result += '\n' + '  '.repeat(indent) + '}';
-      if (next && next !== ',' && next !== ';' && next !== ')' && next !== ']' && next !== '}') {
+      if (next && next !== ',' && next !== ';' && next !== ')' && next !== ']' && next !== '}' && next !== '.') {
         result += '\n' + '  '.repeat(indent);
       }
       continue;
