@@ -1,0 +1,97 @@
+{
+  "manifest_version": 3,
+  "name": "PIXEL HITER: v.1.2litex",
+  "version": "1.0.1",
+  "description": "Next generations of automation.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess",
+    "offscreen",
+    "downloads",
+    "clipboardWrite",
+    "tabs",
+    "webNavigation",
+    "alarms",
+    "proxy",
+    "webRequest",
+    "webRequestAuthProvider",
+    "browsingData",
+    "privacy"
+    ,
+    "cookies"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "script/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": ["script/content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "*://*.hcaptcha.com/*",
+        "*://hcaptcha.com/*",
+        "*://newassets.hcaptcha.com/*"
+      ],
+      "js": ["script/hcaptcha.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "script/inject.js",
+        "script/storage.js",
+        "script/autofill.js",
+        "script/proxyhandler.js",
+        "script/binlibrary.js",
+        "script/countrylist.json",
+        "script/countrylist.js",
+        "styles.css",
+        "sounds/hit.wav",
+        "sounds/music.mp3",
+        "icons/icon128.png",
+        "fonts/SpaceGrotesk-Light.woff2",
+        "fonts/SpaceGrotesk-Regular.woff2",
+        "fonts/SpaceGrotesk-Medium.woff2",
+        "fonts/SpaceGrotesk-SemiBold.woff2",
+        "fonts/SpaceGrotesk-Bold.woff2"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "ruleset_1",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "PixelAutoX Dashboard"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
